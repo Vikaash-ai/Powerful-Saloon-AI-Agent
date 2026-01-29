@@ -844,6 +844,11 @@ def root():
         "hint": "Try /docs, /api/v1/health",
     }
 
+@app.get("/api/v1/debug/serp-key")
+def debug_serp_key():
+    k = (settings.SERPAPI_API_KEY or "").strip()
+    return {"starts_with": k[:4], "length": len(k)}
+
 @app.get("/api/v1/health")
 def health():
     return {"ok": True}
