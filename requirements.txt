@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+httpx
+stripe
+pydantic-settings
+SQLAlchemy
+beautifulsoup4
+lxml
+firebase-admin
+supabase
+PyJWT
