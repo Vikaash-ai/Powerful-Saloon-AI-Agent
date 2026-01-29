@@ -29,11 +29,9 @@ import firebase_admin
 from firebase_admin import auth as fb_auth
 from firebase_admin import credentials
 
-from supabase import create_client
-
 
 # -----------------------------------------------------------------------------
-# Settings (NO hardcoded secrets here)
+# Settings
 # -----------------------------------------------------------------------------
 class Settings(BaseSettings):
     APP_NAME: str = "Saloon AI Agent"
@@ -46,12 +44,11 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_PROFILES_TABLE: str = "profiles"
-    SUPABASE_CONSUME_CREDIT_RPC: str = "consume_credit"
 
     # Firebase Admin credentials
     FIREBASE_PROJECT_ID: str
     FIREBASE_CLIENT_EMAIL: str
-    FIREBASE_PRIVATE_KEY: str
+    FIREBASE_PRIVATE_KEY: str  # store with \n in env; we convert.
 
     # SerpApi
     SERPAPI_API_KEY: str
@@ -350,10 +347,88 @@ def get_current_user_id(authorization: str = Header(default="")) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Supabase admin (storage only)
+# Supabase via PostgREST HTTP (fixes StreamReset by forcing http2=False + retries)
 # -----------------------------------------------------------------------------
-def supabase_admin():
-    return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+def _postgrest_base() -> str:
+    return settings.SUPABASE_URL.rstrip("/") + "/rest/v1"
+
+
+def _supabase_headers() -> dict[str, str]:
+    return {
+        "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+        "Accept": "application/json",
+        "Connection": "close",
+    }
+
+
+def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) -> dict[str, Any]:
+    base = _postgrest_base()
+    url = f"{base}/{table}"
+
+    params: dict[str, str] = {"select": select_cols}
+    for k, v in filters.items():
+        params[k] = f"eq.{v}"
+
+    headers = _supabase_headers()
+    timeout = httpx.Timeout(20.0, connect=8.0)
+
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=timeout, headers=headers, http2=False) as client:
+                r = client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            if isinstance(data, list):
+                return data[0] if data else {}
+            if isinstance(data, dict):
+                return data
+            return {}
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
+            last_err = e
+            time.sleep(0.5 * attempt)
+            continue
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"Supabase read failed: {e.response.status_code}") from e
+        except Exception as e:
+            last_err = e
+            break
+
+    raise HTTPException(status_code=502, detail=f"Supabase read failed: {type(last_err).__name__}")
+
+
+def postgrest_patch(table: str, updates: dict[str, Any], filters: dict[str, str]) -> None:
+    base = _postgrest_base()
+    url = f"{base}/{table}"
+
+    params: dict[str, str] = {}
+    for k, v in filters.items():
+        params[k] = f"eq.{v}"
+
+    headers = _supabase_headers()
+    headers["Prefer"] = "return=minimal"
+    timeout = httpx.Timeout(20.0, connect=8.0)
+
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=timeout, headers=headers, http2=False) as client:
+                r = client.patch(url, params=params, json=updates)
+                r.raise_for_status()
+            return
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
+            last_err = e
+            time.sleep(0.5 * attempt)
+            continue
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"Supabase update failed: {e.response.status_code}") from e
+        except Exception as e:
+            last_err = e
+            break
+
+    raise HTTPException(status_code=502, detail=f"Supabase update failed: {type(last_err).__name__}")
 
 
 class UserLocation(BaseModel):
@@ -363,50 +438,43 @@ class UserLocation(BaseModel):
     country: Optional[str] = None
 
 
+# NOTE: if your profiles key column is user_id, change {"id": user_id} -> {"user_id": user_id}
+PROFILE_KEY_COL = "id"
+
+
 def get_user_credit(user_id: str) -> int:
-    sb = supabase_admin()
-    resp = sb.table(settings.SUPABASE_PROFILES_TABLE).select("credit").eq("id", user_id).single().execute()
-    return int((resp.data or {}).get("credit") or 0)
+    row = postgrest_get_single(
+        table=settings.SUPABASE_PROFILES_TABLE,
+        select_cols="credit",
+        filters={PROFILE_KEY_COL: user_id},
+    )
+    return int(row.get("credit") or 0)
 
 
 def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
-    sb = supabase_admin()
-    rpc = (settings.SUPABASE_CONSUME_CREDIT_RPC or "").strip()
-
-    if rpc:
-        try:
-            res = sb.rpc(rpc, {"p_user_id": user_id, "p_amount": amount}).execute()
-            data = res.data
-            if isinstance(data, dict) and "credit" in data:
-                return int(data["credit"])
-            if isinstance(data, list) and data and isinstance(data[0], dict) and "credit" in data[0]:
-                return int(data[0]["credit"])
-        except Exception:
-            pass
-
     current = get_user_credit(user_id)
     if current < amount:
         raise HTTPException(status_code=402, detail="Not enough credits")
     new_val = current - amount
-    sb.table(settings.SUPABASE_PROFILES_TABLE).update({"credit": new_val}).eq("id", user_id).execute()
+    postgrest_patch(
+        table=settings.SUPABASE_PROFILES_TABLE,
+        updates={"credit": new_val},
+        filters={PROFILE_KEY_COL: user_id},
+    )
     return new_val
 
 
 def fetch_user_location_and_country(user_id: str) -> UserLocation:
-    sb = supabase_admin()
-    resp = (
-        sb.table(settings.SUPABASE_PROFILES_TABLE)
-        .select("city,suburb,postcode,country")
-        .eq("id", user_id)
-        .single()
-        .execute()
+    row = postgrest_get_single(
+        table=settings.SUPABASE_PROFILES_TABLE,
+        select_cols="city,suburb,postcode,country",
+        filters={PROFILE_KEY_COL: user_id},
     )
-    data = resp.data or {}
     return UserLocation(
-        city=data.get("city"),
-        suburb=data.get("suburb"),
-        postcode=data.get("postcode"),
-        country=data.get("country"),
+        city=row.get("city"),
+        suburb=row.get("suburb"),
+        postcode=row.get("postcode"),
+        country=row.get("country"),
     )
 
 
@@ -432,7 +500,7 @@ def sha256(s: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# SerpApi (FIXED: retries + http2 disabled)
+# SerpApi (resilient)
 # -----------------------------------------------------------------------------
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
@@ -500,11 +568,12 @@ def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) 
 
 
 # -----------------------------------------------------------------------------
-# SSRF-hardened fetch + booking extraction (same logic you already had)
+# SSRF-hardened fetch + booking extraction
 # -----------------------------------------------------------------------------
 DISALLOWED_SCHEMES = {"file", "ftp", "gopher", "ws", "wss", "data", "javascript"}
 SUSPICIOUS_TLDS = (".local", ".internal", ".lan")
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9\.\-]{0,252}[a-z0-9]$")
+
 
 def resolve_host_ips(hostname: str) -> list[str]:
     infos = socket.getaddrinfo(hostname, None)
@@ -513,6 +582,7 @@ def resolve_host_ips(hostname: str) -> list[str]:
         if family in (socket.AF_INET, socket.AF_INET6):
             ips.add(str(sockaddr[0]))
     return sorted(ips)
+
 
 def is_ip_private_or_local(ip: str) -> bool:
     try:
@@ -528,12 +598,14 @@ def is_ip_private_or_local(ip: str) -> bool:
     except ValueError:
         return True
 
+
 def looks_like_ip_host(host: str) -> bool:
     try:
         ipaddress.ip_address(host)
         return True
     except ValueError:
         return False
+
 
 def registrable_domain(hostname: str) -> str:
     parts = hostname.split(".")
@@ -543,6 +615,7 @@ def registrable_domain(hostname: str) -> str:
     if tld3.endswith(("co.nz", "org.nz", "ac.nz", "govt.nz", "net.nz", "iwi.nz")):
         return tld3
     return ".".join(parts[-2:])
+
 
 def normalize_and_validate_url(url: str) -> str:
     if not url or not isinstance(url, str):
@@ -583,6 +656,7 @@ def normalize_and_validate_url(url: str) -> str:
 
     return urlunparse((scheme, parsed.netloc, parsed.path or "/", "", parsed.query, ""))
 
+
 def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
     budget.spend(settings.COST_WEB_FETCH)
     budget.website_fetches += 1
@@ -602,6 +676,7 @@ def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
             raise ValueError("Response too large")
         return content.decode(r.encoding or "utf-8", errors="replace")
 
+
 PROVIDER_RULES: dict[str, list[str]] = {
     "timely": ["timelyapp.com", "timely.nz"],
     "fresha": ["fresha.com"],
@@ -609,6 +684,7 @@ PROVIDER_RULES: dict[str, list[str]] = {
     "booksy": ["booksy.com"],
 }
 BOOKING_KEYWORDS = ("book", "booking", "appointments", "appointment", "reserve", "reservation", "schedule")
+
 
 def detect_provider(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
@@ -618,6 +694,7 @@ def detect_provider(url: str) -> str:
                 return provider
     return "other"
 
+
 def strip_tracking_params(url: str) -> str:
     parsed = urlparse(url)
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -626,6 +703,7 @@ def strip_tracking_params(url: str) -> str:
         if lk.startswith("utm_") or lk in {"gclid", "fbclid", "mc_cid", "mc_eid"}:
             q.pop(k, None)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", urlencode(q, doseq=True), ""))
+
 
 def booking_confidence(url: str, anchor_text: str = "") -> int:
     prov = detect_provider(url)
@@ -638,6 +716,7 @@ def booking_confidence(url: str, anchor_text: str = "") -> int:
         score += 10
     return max(0, min(100, score))
 
+
 def booking_link_allowed(salon_website: str, booking_url: str) -> bool:
     b = normalize_and_validate_url(booking_url)
     s = normalize_and_validate_url(salon_website)
@@ -646,6 +725,7 @@ def booking_link_allowed(salon_website: str, booking_url: str) -> bool:
     bh = (urlparse(b).hostname or "").lower()
     sh = (urlparse(s).hostname or "").lower()
     return registrable_domain(bh) == registrable_domain(sh)
+
 
 def extract_booking_url_from_website(
     salon_website: Optional[str],
@@ -725,6 +805,7 @@ def salon_key(salon: dict[str, Any]) -> str:
     }
     return sha256(json.dumps(payload, sort_keys=True))
 
+
 def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any]) -> stripe.checkout.Session:
     skey = salon_key(salon)
     return stripe.checkout.Session.create(
@@ -744,6 +825,7 @@ class SalonSearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=30)
     location_override: Optional[UserLocation] = None
 
+
 class SalonResult(BaseModel):
     name: str
     address: Optional[str] = None
@@ -752,20 +834,25 @@ class SalonResult(BaseModel):
     rating: Optional[float] = None
     reviews: Optional[int] = None
 
+
 class SalonSearchResponse(BaseModel):
     salons: list[SalonResult]
     meta: dict[str, Any] = {}
 
+
 class StartBookingPaymentRequest(BaseModel):
     salon: dict[str, Any]
+
 
 class StartBookingPaymentResponse(BaseModel):
     checkout_url: str
     stripe_session_id: str
 
+
 class RevealBookingRequest(BaseModel):
     salon: dict[str, Any]
     stripe_session_id: str
+
 
 class RevealBookingResponse(BaseModel):
     booking_url: Optional[str] = None
@@ -791,15 +878,12 @@ app.add_middleware(RequestIdMiddleware)
 app.add_middleware(BanAndRateLimitMiddleware)
 app.add_middleware(ErrorHandlerMiddleware)
 
-@app.exception_handler(Exception)
-async def all_exception_handler(request: Request, exc: Exception):
-    log.exception("UNHANDLED: %s", str(exc))
-    return JSONResponse(status_code=500, content={"detail": "Internal server error", "error": str(exc)})
 
 @app.on_event("startup")
 def startup():
     init_db()
     log.info(jlog("startup", env=settings.ENVIRONMENT, db=settings.DATABASE_URL, allowed_origins=settings.allowed_origins_list()))
+
 
 @app.get("/")
 def root():
@@ -810,9 +894,11 @@ def root():
         "hint": "Try /docs, /api/v1/health",
     }
 
+
 @app.get("/api/v1/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/api/v1/salons/search", response_model=SalonSearchResponse)
 def salons_search(
@@ -820,7 +906,6 @@ def salons_search(
     request: Request,
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
     rid = getattr(request.state, "request_id", None) or str(uuid.uuid4())
     limit = max(1, min(int(req.limit), settings.MAX_LIMIT))
@@ -853,12 +938,14 @@ def salons_search(
     salons.sort(key=lambda s: (-(s.rating or 0.0), -(s.reviews or 0)))
     return SalonSearchResponse(salons=salons[:limit], meta={"query_used": q, "request_id": rid})
 
+
 @app.post("/api/v1/booking/start-payment", response_model=StartBookingPaymentResponse)
 def start_booking_payment(req: StartBookingPaymentRequest, user_id: str = Depends(get_current_user_id)):
     session = create_booking_fee_checkout_session(user_id=user_id, salon=req.salon)
     if not session.url:
         raise HTTPException(status_code=500, detail="Stripe session URL is missing")
     return StartBookingPaymentResponse(checkout_url=session.url, stripe_session_id=session.id)
+
 
 @app.post("/api/v1/booking/reveal", response_model=RevealBookingResponse)
 def reveal_booking(
@@ -895,6 +982,7 @@ def reveal_booking(
         evidence=evidence,
         credits_left=get_user_credit(user_id),
     )
+
 
 @app.post("/api/v1/stripe/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
