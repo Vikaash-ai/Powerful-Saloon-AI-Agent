@@ -526,7 +526,11 @@ def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) 
             time.sleep(0.5 * attempt)
             continue
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"SerpApi HTTP error: {e.response.status_code}") from e
+            msg = e.response.text
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase read failed: {e.response.status_code} - {msg}"
+            ) from e
         except Exception as e:
             last_err = e
             break
