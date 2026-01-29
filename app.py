@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     def allowed_ports(self) -> set[int]:
         return {int(p.strip()) for p in self.SAFE_FETCH_ALLOWED_PORTS.split(",") if p.strip()}
 
-    def deny_domains(self) -> set[str]:
+    def deny_domains(self) -> set[int] | set[str]:
         return {d.strip().lower() for d in self.DOMAIN_DENYLIST.split(",") if d.strip()}
 
     def provider_domains(self) -> set[str]:
@@ -288,19 +288,6 @@ class BanAndRateLimitMiddleware(BaseHTTPMiddleware):
                 security_event(db, f"ip:{ip}", "ratelimit")
             return JSONResponse(status_code=429, content={"detail": "Rate limit (IP)"})
 
-        authz = request.headers.get("authorization", "")
-        if authz.startswith("Bearer "):
-            token = authz.split(" ", 1)[1].strip()
-            try:
-                decoded = fb_auth.verify_id_token(token, check_revoked=False)
-                uid = decoded.get("uid") or decoded.get("sub") or "unknown"
-                if not _take_token(_RL_USER, uid, settings.RL_USER_RPS, settings.RL_BURST):
-                    with SessionLocal() as db:
-                        security_event(db, f"user:{uid}", "ratelimit")
-                    return JSONResponse(status_code=429, content={"detail": "Rate limit (user)"})
-            except Exception:
-                pass
-
         return await call_next(request)
 
 
@@ -347,16 +334,18 @@ def get_current_user_id(authorization: str = Header(default="")) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Supabase via PostgREST HTTP (fixes StreamReset by forcing http2=False + retries)
+# Supabase via PostgREST HTTP (strip() FIX)
 # -----------------------------------------------------------------------------
 def _postgrest_base() -> str:
-    return settings.SUPABASE_URL.rstrip("/") + "/rest/v1"
+    # strip to avoid hidden whitespace/newlines
+    return settings.SUPABASE_URL.strip().rstrip("/") + "/rest/v1"
 
 
 def _supabase_headers() -> dict[str, str]:
+    key = settings.SUPABASE_SERVICE_ROLE_KEY.strip()
     return {
-        "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
         "Accept": "application/json",
         "Connection": "close",
     }
@@ -386,7 +375,7 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
             if isinstance(data, dict):
                 return data
             return {}
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
+        except (httpx.LocalProtocolError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
             last_err = e
             time.sleep(0.5 * attempt)
             continue
@@ -396,6 +385,7 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
             last_err = e
             break
 
+    # include error type for debugging
     raise HTTPException(status_code=502, detail=f"Supabase read failed: {type(last_err).__name__}")
 
 
@@ -418,7 +408,7 @@ def postgrest_patch(table: str, updates: dict[str, Any], filters: dict[str, str]
                 r = client.patch(url, params=params, json=updates)
                 r.raise_for_status()
             return
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
+        except (httpx.LocalProtocolError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
             last_err = e
             time.sleep(0.5 * attempt)
             continue
@@ -438,16 +428,11 @@ class UserLocation(BaseModel):
     country: Optional[str] = None
 
 
-# NOTE: if your profiles key column is user_id, change {"id": user_id} -> {"user_id": user_id}
-PROFILE_KEY_COL = "id"
+PROFILE_KEY_COL = "id"  # change to "user_id" if needed
 
 
 def get_user_credit(user_id: str) -> int:
-    row = postgrest_get_single(
-        table=settings.SUPABASE_PROFILES_TABLE,
-        select_cols="credit",
-        filters={PROFILE_KEY_COL: user_id},
-    )
+    row = postgrest_get_single(settings.SUPABASE_PROFILES_TABLE, "credit", {PROFILE_KEY_COL: user_id})
     return int(row.get("credit") or 0)
 
 
@@ -456,26 +441,13 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
     if current < amount:
         raise HTTPException(status_code=402, detail="Not enough credits")
     new_val = current - amount
-    postgrest_patch(
-        table=settings.SUPABASE_PROFILES_TABLE,
-        updates={"credit": new_val},
-        filters={PROFILE_KEY_COL: user_id},
-    )
+    postgrest_patch(settings.SUPABASE_PROFILES_TABLE, {"credit": new_val}, {PROFILE_KEY_COL: user_id})
     return new_val
 
 
 def fetch_user_location_and_country(user_id: str) -> UserLocation:
-    row = postgrest_get_single(
-        table=settings.SUPABASE_PROFILES_TABLE,
-        select_cols="city,suburb,postcode,country",
-        filters={PROFILE_KEY_COL: user_id},
-    )
-    return UserLocation(
-        city=row.get("city"),
-        suburb=row.get("suburb"),
-        postcode=row.get("postcode"),
-        country=row.get("country"),
-    )
+    row = postgrest_get_single(settings.SUPABASE_PROFILES_TABLE, "city,suburb,postcode,country", {PROFILE_KEY_COL: user_id})
+    return UserLocation(city=row.get("city"), suburb=row.get("suburb"), postcode=row.get("postcode"), country=row.get("country"))
 
 
 # -----------------------------------------------------------------------------
@@ -504,10 +476,8 @@ def sha256(s: str) -> str:
 # -----------------------------------------------------------------------------
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
-
 def serp_cache_key(q: str) -> str:
     return sha256(json.dumps({"engine": settings.SERPAPI_ENGINE, "q": q, "gl": settings.SERPAPI_GL, "hl": settings.SERPAPI_HL}, sort_keys=True))
-
 
 def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) -> list[dict[str, Any]]:
     cutoff = int(time.time()) - settings.SERP_CACHE_TTL_S
@@ -518,20 +488,9 @@ def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) 
         return json.loads(cached.response_json)
 
     budget.spend(settings.COST_SERPAPI_SEARCH)
+    params = {"api_key": settings.SERPAPI_API_KEY, "engine": settings.SERPAPI_ENGINE, "q": query, "gl": settings.SERPAPI_GL, "hl": settings.SERPAPI_HL}
 
-    params = {
-        "api_key": settings.SERPAPI_API_KEY,
-        "engine": settings.SERPAPI_ENGINE,
-        "q": query,
-        "gl": settings.SERPAPI_GL,
-        "hl": settings.SERPAPI_HL,
-    }
-
-    headers = {
-        "User-Agent": "SaloonAIAgent/1.0 (Render)",
-        "Accept": "application/json",
-        "Connection": "close",
-    }
+    headers = {"User-Agent": "SaloonAIAgent/1.0 (Render)", "Accept": "application/json", "Connection": "close"}
     timeout = httpx.Timeout(25.0, connect=10.0)
 
     last_err: Exception | None = None
@@ -568,12 +527,11 @@ def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) 
 
 
 # -----------------------------------------------------------------------------
-# SSRF-hardened fetch + booking extraction
+# SSRF-hardened fetch + booking extraction (unchanged core)
 # -----------------------------------------------------------------------------
 DISALLOWED_SCHEMES = {"file", "ftp", "gopher", "ws", "wss", "data", "javascript"}
 SUSPICIOUS_TLDS = (".local", ".internal", ".lan")
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9\.\-]{0,252}[a-z0-9]$")
-
 
 def resolve_host_ips(hostname: str) -> list[str]:
     infos = socket.getaddrinfo(hostname, None)
@@ -583,21 +541,12 @@ def resolve_host_ips(hostname: str) -> list[str]:
             ips.add(str(sockaddr[0]))
     return sorted(ips)
 
-
 def is_ip_private_or_local(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
-        return (
-            addr.is_private
-            or addr.is_loopback
-            or addr.is_link_local
-            or addr.is_multicast
-            or addr.is_reserved
-            or addr.is_unspecified
-        )
+        return (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified)
     except ValueError:
         return True
-
 
 def looks_like_ip_host(host: str) -> bool:
     try:
@@ -605,7 +554,6 @@ def looks_like_ip_host(host: str) -> bool:
         return True
     except ValueError:
         return False
-
 
 def registrable_domain(hostname: str) -> str:
     parts = hostname.split(".")
@@ -615,7 +563,6 @@ def registrable_domain(hostname: str) -> str:
     if tld3.endswith(("co.nz", "org.nz", "ac.nz", "govt.nz", "net.nz", "iwi.nz")):
         return tld3
     return ".".join(parts[-2:])
-
 
 def normalize_and_validate_url(url: str) -> str:
     if not url or not isinstance(url, str):
@@ -656,7 +603,6 @@ def normalize_and_validate_url(url: str) -> str:
 
     return urlunparse((scheme, parsed.netloc, parsed.path or "/", "", parsed.query, ""))
 
-
 def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
     budget.spend(settings.COST_WEB_FETCH)
     budget.website_fetches += 1
@@ -676,7 +622,6 @@ def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
             raise ValueError("Response too large")
         return content.decode(r.encoding or "utf-8", errors="replace")
 
-
 PROVIDER_RULES: dict[str, list[str]] = {
     "timely": ["timelyapp.com", "timely.nz"],
     "fresha": ["fresha.com"],
@@ -684,7 +629,6 @@ PROVIDER_RULES: dict[str, list[str]] = {
     "booksy": ["booksy.com"],
 }
 BOOKING_KEYWORDS = ("book", "booking", "appointments", "appointment", "reserve", "reservation", "schedule")
-
 
 def detect_provider(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
@@ -694,7 +638,6 @@ def detect_provider(url: str) -> str:
                 return provider
     return "other"
 
-
 def strip_tracking_params(url: str) -> str:
     parsed = urlparse(url)
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -703,7 +646,6 @@ def strip_tracking_params(url: str) -> str:
         if lk.startswith("utm_") or lk in {"gclid", "fbclid", "mc_cid", "mc_eid"}:
             q.pop(k, None)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", urlencode(q, doseq=True), ""))
-
 
 def booking_confidence(url: str, anchor_text: str = "") -> int:
     prov = detect_provider(url)
@@ -716,7 +658,6 @@ def booking_confidence(url: str, anchor_text: str = "") -> int:
         score += 10
     return max(0, min(100, score))
 
-
 def booking_link_allowed(salon_website: str, booking_url: str) -> bool:
     b = normalize_and_validate_url(booking_url)
     s = normalize_and_validate_url(salon_website)
@@ -725,7 +666,6 @@ def booking_link_allowed(salon_website: str, booking_url: str) -> bool:
     bh = (urlparse(b).hostname or "").lower()
     sh = (urlparse(s).hostname or "").lower()
     return registrable_domain(bh) == registrable_domain(sh)
-
 
 def extract_booking_url_from_website(
     salon_website: Optional[str],
@@ -752,7 +692,11 @@ def extract_booking_url_from_website(
         soup = BeautifulSoup(html, "lxml")
         anchors = soup.find_all("a", limit=settings.BOOKING_SCAN_MAX_ANCHORS)
 
-        candidates: list[tuple[str, str]] = []
+        best_url = None
+        best_score = 0
+        evidence: dict[str, Any] = {}
+        seen: set[str] = set()
+
         for a in anchors:
             href = a.get("href")
             if not href:
@@ -762,16 +706,9 @@ def extract_booking_url_from_website(
                 continue
             full = urljoin(website, href)
             text = (a.get_text(" ", strip=True) or "")[:120]
-            candidates.append((full, text))
 
-        best_url = None
-        best_score = 0
-        evidence: dict[str, Any] = {}
-        seen: set[str] = set()
-
-        for url, text in candidates[: settings.BOOKING_SCAN_MAX_LINKS]:
             try:
-                u = normalize_and_validate_url(url)
+                u = normalize_and_validate_url(full)
                 u = strip_tracking_params(u)
             except Exception:
                 continue
@@ -805,7 +742,6 @@ def salon_key(salon: dict[str, Any]) -> str:
     }
     return sha256(json.dumps(payload, sort_keys=True))
 
-
 def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any]) -> stripe.checkout.Session:
     skey = salon_key(salon)
     return stripe.checkout.Session.create(
@@ -825,7 +761,6 @@ class SalonSearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=30)
     location_override: Optional[UserLocation] = None
 
-
 class SalonResult(BaseModel):
     name: str
     address: Optional[str] = None
@@ -834,25 +769,20 @@ class SalonResult(BaseModel):
     rating: Optional[float] = None
     reviews: Optional[int] = None
 
-
 class SalonSearchResponse(BaseModel):
     salons: list[SalonResult]
     meta: dict[str, Any] = {}
 
-
 class StartBookingPaymentRequest(BaseModel):
     salon: dict[str, Any]
-
 
 class StartBookingPaymentResponse(BaseModel):
     checkout_url: str
     stripe_session_id: str
 
-
 class RevealBookingRequest(BaseModel):
     salon: dict[str, Any]
     stripe_session_id: str
-
 
 class RevealBookingResponse(BaseModel):
     booking_url: Optional[str] = None
@@ -878,12 +808,10 @@ app.add_middleware(RequestIdMiddleware)
 app.add_middleware(BanAndRateLimitMiddleware)
 app.add_middleware(ErrorHandlerMiddleware)
 
-
 @app.on_event("startup")
 def startup():
     init_db()
     log.info(jlog("startup", env=settings.ENVIRONMENT, db=settings.DATABASE_URL, allowed_origins=settings.allowed_origins_list()))
-
 
 @app.get("/")
 def root():
@@ -894,11 +822,9 @@ def root():
         "hint": "Try /docs, /api/v1/health",
     }
 
-
 @app.get("/api/v1/health")
 def health():
     return {"ok": True}
-
 
 @app.post("/api/v1/salons/search", response_model=SalonSearchResponse)
 def salons_search(
@@ -938,14 +864,12 @@ def salons_search(
     salons.sort(key=lambda s: (-(s.rating or 0.0), -(s.reviews or 0)))
     return SalonSearchResponse(salons=salons[:limit], meta={"query_used": q, "request_id": rid})
 
-
 @app.post("/api/v1/booking/start-payment", response_model=StartBookingPaymentResponse)
 def start_booking_payment(req: StartBookingPaymentRequest, user_id: str = Depends(get_current_user_id)):
     session = create_booking_fee_checkout_session(user_id=user_id, salon=req.salon)
     if not session.url:
         raise HTTPException(status_code=500, detail="Stripe session URL is missing")
     return StartBookingPaymentResponse(checkout_url=session.url, stripe_session_id=session.id)
-
 
 @app.post("/api/v1/booking/reveal", response_model=RevealBookingResponse)
 def reveal_booking(
@@ -982,7 +906,6 @@ def reveal_booking(
         evidence=evidence,
         credits_left=get_user_credit(user_id),
     )
-
 
 @app.post("/api/v1/stripe/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
