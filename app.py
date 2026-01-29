@@ -337,12 +337,20 @@ def get_current_user_id(authorization: str = Header(default="")) -> str:
 # Supabase via PostgREST HTTP (strip() FIX)
 # -----------------------------------------------------------------------------
 def _postgrest_base() -> str:
-    # strip to avoid hidden whitespace/newlines
     return settings.SUPABASE_URL.strip().rstrip("/") + "/rest/v1"
+
+def _sanitize_header_value(v: str) -> str:
+    # Remove surrounding whitespace and any control characters (including newlines)
+    v = (v or "").strip()
+    v = "".join(ch for ch in v if 32 <= ord(ch) <= 126)
+    return v
 
 
 def _supabase_headers() -> dict[str, str]:
-    key = settings.SUPABASE_SERVICE_ROLE_KEY.strip()
+    key = _sanitize_header_value(settings.SUPABASE_SERVICE_ROLE_KEY)
+    if not key.startswith("eyJ"):
+        # helps you catch wrong key instantly
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY is invalid/malformed")
     return {
         "apikey": key,
         "Authorization": f"Bearer {key}",
