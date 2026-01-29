@@ -38,9 +38,6 @@ from supabase import create_client
 class Settings(BaseSettings):
     APP_NAME: str = "Saloon AI Agent"
     ENVIRONMENT: str = "dev"
-
-    # IMPORTANT: must match your frontend dev origin
-    # For Vite: http://localhost:5173
     ALLOWED_ORIGINS: str = "http://localhost:5173"
 
     DATABASE_URL: str = "sqlite:///./app.db"
@@ -54,7 +51,7 @@ class Settings(BaseSettings):
     # Firebase Admin credentials
     FIREBASE_PROJECT_ID: str
     FIREBASE_CLIENT_EMAIL: str
-    FIREBASE_PRIVATE_KEY: str  # store with \n in env; we convert.
+    FIREBASE_PRIVATE_KEY: str
 
     # SerpApi
     SERPAPI_API_KEY: str
@@ -133,7 +130,6 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("backend")
 
@@ -142,10 +138,8 @@ def jlog(event: str, **fields: Any) -> str:
     return json.dumps({"event": event, **fields}, ensure_ascii=False, separators=(",", ":"))
 
 
-# Stripe init
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-# Firebase Admin init
 if not firebase_admin._apps:
     private_key = settings.FIREBASE_PRIVATE_KEY.replace("\\n", "\n")
     cred = credentials.Certificate(
@@ -438,7 +432,7 @@ def sha256(s: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# SerpApi
+# SerpApi (FIXED: retries + http2 disabled)
 # -----------------------------------------------------------------------------
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
@@ -456,6 +450,7 @@ def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) 
         return json.loads(cached.response_json)
 
     budget.spend(settings.COST_SERPAPI_SEARCH)
+
     params = {
         "api_key": settings.SERPAPI_API_KEY,
         "engine": settings.SERPAPI_ENGINE,
@@ -464,23 +459,44 @@ def serp_search_local(db: Session, query: str, budget: Budget, request_id: str) 
         "hl": settings.SERPAPI_HL,
     }
 
-    timeout = httpx.Timeout(18.0, connect=5.0)
-    with httpx.Client(timeout=timeout) as client:
-        r = client.get(SERPAPI_ENDPOINT, params=params)
-        r.raise_for_status()
-        data = r.json()
+    headers = {
+        "User-Agent": "SaloonAIAgent/1.0 (Render)",
+        "Accept": "application/json",
+        "Connection": "close",
+    }
+    timeout = httpx.Timeout(25.0, connect=10.0)
 
-    local_results = data.get("local_results") or data.get("place_results") or []
-    if not isinstance(local_results, list):
-        local_results = []
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=timeout, headers=headers, http2=False) as client:
+                r = client.get(SERPAPI_ENDPOINT, params=params)
+                r.raise_for_status()
+                data = r.json()
 
-    db.add(SerpCache(key=key, response_json=json.dumps(local_results, ensure_ascii=False)))
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
+            local_results = data.get("local_results") or data.get("place_results") or []
+            if not isinstance(local_results, list):
+                local_results = []
 
-    return local_results
+            db.add(SerpCache(key=key, response_json=json.dumps(local_results, ensure_ascii=False)))
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+
+            return local_results
+
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout) as e:
+            last_err = e
+            time.sleep(0.5 * attempt)
+            continue
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"SerpApi HTTP error: {e.response.status_code}") from e
+        except Exception as e:
+            last_err = e
+            break
+
+    raise HTTPException(status_code=502, detail=f"SerpApi request failed: {type(last_err).__name__}")
 
 
 # -----------------------------------------------------------------------------
@@ -490,7 +506,6 @@ DISALLOWED_SCHEMES = {"file", "ftp", "gopher", "ws", "wss", "data", "javascript"
 SUSPICIOUS_TLDS = (".local", ".internal", ".lan")
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9\.\-]{0,252}[a-z0-9]$")
 
-
 def resolve_host_ips(hostname: str) -> list[str]:
     infos = socket.getaddrinfo(hostname, None)
     ips: set[str] = set()
@@ -498,7 +513,6 @@ def resolve_host_ips(hostname: str) -> list[str]:
         if family in (socket.AF_INET, socket.AF_INET6):
             ips.add(str(sockaddr[0]))
     return sorted(ips)
-
 
 def is_ip_private_or_local(ip: str) -> bool:
     try:
@@ -514,14 +528,12 @@ def is_ip_private_or_local(ip: str) -> bool:
     except ValueError:
         return True
 
-
 def looks_like_ip_host(host: str) -> bool:
     try:
         ipaddress.ip_address(host)
         return True
     except ValueError:
         return False
-
 
 def registrable_domain(hostname: str) -> str:
     parts = hostname.split(".")
@@ -531,7 +543,6 @@ def registrable_domain(hostname: str) -> str:
     if tld3.endswith(("co.nz", "org.nz", "ac.nz", "govt.nz", "net.nz", "iwi.nz")):
         return tld3
     return ".".join(parts[-2:])
-
 
 def normalize_and_validate_url(url: str) -> str:
     if not url or not isinstance(url, str):
@@ -572,7 +583,6 @@ def normalize_and_validate_url(url: str) -> str:
 
     return urlunparse((scheme, parsed.netloc, parsed.path or "/", "", parsed.query, ""))
 
-
 def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
     budget.spend(settings.COST_WEB_FETCH)
     budget.website_fetches += 1
@@ -581,7 +591,7 @@ def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
     headers = {"User-Agent": settings.SAFE_FETCH_USER_AGENT, "Accept": "text/html,*/*"}
     timeout = httpx.Timeout(settings.SAFE_FETCH_TIMEOUT_S, connect=5.0)
 
-    with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as client:
+    with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True, http2=False) as client:
         r = client.get(url)
         r.raise_for_status()
         ctype = (r.headers.get("content-type") or "").lower()
@@ -592,7 +602,6 @@ def safe_fetch_html(url: str, request_id: str, budget: Budget) -> str:
             raise ValueError("Response too large")
         return content.decode(r.encoding or "utf-8", errors="replace")
 
-
 PROVIDER_RULES: dict[str, list[str]] = {
     "timely": ["timelyapp.com", "timely.nz"],
     "fresha": ["fresha.com"],
@@ -600,7 +609,6 @@ PROVIDER_RULES: dict[str, list[str]] = {
     "booksy": ["booksy.com"],
 }
 BOOKING_KEYWORDS = ("book", "booking", "appointments", "appointment", "reserve", "reservation", "schedule")
-
 
 def detect_provider(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
@@ -610,7 +618,6 @@ def detect_provider(url: str) -> str:
                 return provider
     return "other"
 
-
 def strip_tracking_params(url: str) -> str:
     parsed = urlparse(url)
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -619,7 +626,6 @@ def strip_tracking_params(url: str) -> str:
         if lk.startswith("utm_") or lk in {"gclid", "fbclid", "mc_cid", "mc_eid"}:
             q.pop(k, None)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", urlencode(q, doseq=True), ""))
-
 
 def booking_confidence(url: str, anchor_text: str = "") -> int:
     prov = detect_provider(url)
@@ -632,7 +638,6 @@ def booking_confidence(url: str, anchor_text: str = "") -> int:
         score += 10
     return max(0, min(100, score))
 
-
 def booking_link_allowed(salon_website: str, booking_url: str) -> bool:
     b = normalize_and_validate_url(booking_url)
     s = normalize_and_validate_url(salon_website)
@@ -641,7 +646,6 @@ def booking_link_allowed(salon_website: str, booking_url: str) -> bool:
     bh = (urlparse(b).hostname or "").lower()
     sh = (urlparse(s).hostname or "").lower()
     return registrable_domain(bh) == registrable_domain(sh)
-
 
 def extract_booking_url_from_website(
     salon_website: Optional[str],
@@ -704,48 +708,6 @@ def extract_booking_url_from_website(
         if best_url:
             return best_url, detect_provider(best_url), best_score, evidence
 
-        # one-hop well-known paths (optional)
-        if settings.BOOKING_ONE_HOP_INTERNAL_CRAWL and budget.can_fetch():
-            parsed = urlparse(website)
-            base = urlunparse((parsed.scheme, parsed.netloc, "/", "", "", ""))
-            for p in settings.booking_paths():
-                if not budget.can_fetch():
-                    break
-                guess = urljoin(base, p.lstrip("/"))
-                # cheap one-hop cost
-                budget.spend(settings.COST_WEB_FETCH_ONE_HOP)
-                budget.website_fetches += 1
-                try:
-                    html2 = safe_fetch_html(guess, request_id, budget)
-                except Exception:
-                    continue
-                soup2 = BeautifulSoup(html2, "lxml")
-                anchors2 = soup2.find_all("a", limit=settings.BOOKING_SCAN_MAX_ANCHORS)
-                candidates2: list[tuple[str, str]] = []
-                for a in anchors2:
-                    href = a.get("href")
-                    if not href:
-                        continue
-                    full = urljoin(guess, href.strip())
-                    text = (a.get_text(" ", strip=True) or "")[:120]
-                    candidates2.append((full, text))
-
-                for url, text in candidates2[: settings.BOOKING_SCAN_MAX_LINKS]:
-                    try:
-                        u = normalize_and_validate_url(url)
-                        u = strip_tracking_params(u)
-                    except Exception:
-                        continue
-                    sc = booking_confidence(u, anchor_text=text)
-                    if sc > best_score and booking_link_allowed(website, u):
-                        best_url = u
-                        best_score = sc
-                        evidence = {"anchor_text": text, "source": "well_known_path", "page": guess}
-                        break
-
-                if best_url:
-                    return best_url, detect_provider(best_url), best_score, evidence
-
         return None, "none", 0, {"source": "no_booking_found"}
     except Exception:
         return None, "none", 0, {"source": "fetch_failed"}
@@ -763,7 +725,6 @@ def salon_key(salon: dict[str, Any]) -> str:
     }
     return sha256(json.dumps(payload, sort_keys=True))
 
-
 def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any]) -> stripe.checkout.Session:
     skey = salon_key(salon)
     return stripe.checkout.Session.create(
@@ -776,52 +737,12 @@ def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any]) -> 
 
 
 # -----------------------------------------------------------------------------
-# Idempotency helpers
-# -----------------------------------------------------------------------------
-def idem_hash(payload: dict[str, Any], user_id: str) -> str:
-    return sha256(json.dumps({"user": user_id, "payload": payload}, sort_keys=True))
-
-
-def idem_get(db: Session, user_id: str, key: str, path: str, body_hash: str) -> Optional[dict[str, Any]]:
-    cutoff = int(time.time()) - settings.IDEM_TTL_S
-    row = db.execute(
-        select(IdempotencyCache).where(
-            IdempotencyCache.user_id == user_id,
-            IdempotencyCache.key == key,
-            IdempotencyCache.path == path,
-            IdempotencyCache.body_hash == body_hash,
-            IdempotencyCache.created_at >= cutoff,
-        )
-    ).scalar_one_or_none()
-    if not row:
-        return None
-    return json.loads(row.response_json)
-
-
-def idem_put(db: Session, user_id: str, key: str, path: str, body_hash: str, payload: dict[str, Any]) -> None:
-    db.add(
-        IdempotencyCache(
-            user_id=user_id,
-            key=key,
-            path=path,
-            body_hash=body_hash,
-            response_json=json.dumps(payload, ensure_ascii=False),
-        )
-    )
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-
-
-# -----------------------------------------------------------------------------
 # API models
 # -----------------------------------------------------------------------------
 class SalonSearchRequest(BaseModel):
     query: Optional[str] = Field(default=None, max_length=80)
     limit: int = Field(default=10, ge=1, le=30)
     location_override: Optional[UserLocation] = None
-
 
 class SalonResult(BaseModel):
     name: str
@@ -831,25 +752,20 @@ class SalonResult(BaseModel):
     rating: Optional[float] = None
     reviews: Optional[int] = None
 
-
 class SalonSearchResponse(BaseModel):
     salons: list[SalonResult]
     meta: dict[str, Any] = {}
 
-
 class StartBookingPaymentRequest(BaseModel):
     salon: dict[str, Any]
-
 
 class StartBookingPaymentResponse(BaseModel):
     checkout_url: str
     stripe_session_id: str
 
-
 class RevealBookingRequest(BaseModel):
     salon: dict[str, Any]
     stripe_session_id: str
-
 
 class RevealBookingResponse(BaseModel):
     booking_url: Optional[str] = None
@@ -860,7 +776,7 @@ class RevealBookingResponse(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# FastAPI app (CORS FIXED via env var)
+# FastAPI app
 # -----------------------------------------------------------------------------
 app = FastAPI(title=settings.APP_NAME)
 
@@ -871,17 +787,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(BanAndRateLimitMiddleware)
 app.add_middleware(ErrorHandlerMiddleware)
 
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    log.exception("UNHANDLED: %s", str(exc))
+    return JSONResponse(status_code=500, content={"detail": "Internal server error", "error": str(exc)})
 
 @app.on_event("startup")
 def startup():
     init_db()
     log.info(jlog("startup", env=settings.ENVIRONMENT, db=settings.DATABASE_URL, allowed_origins=settings.allowed_origins_list()))
-
 
 @app.get("/")
 def root():
@@ -892,11 +810,9 @@ def root():
         "hint": "Try /docs, /api/v1/health",
     }
 
-
 @app.get("/api/v1/health")
 def health():
     return {"ok": True}
-
 
 @app.post("/api/v1/salons/search", response_model=SalonSearchResponse)
 def salons_search(
@@ -909,13 +825,6 @@ def salons_search(
     rid = getattr(request.state, "request_id", None) or str(uuid.uuid4())
     limit = max(1, min(int(req.limit), settings.MAX_LIMIT))
     budget = Budget(tokens_left=settings.BUDGET_TOKENS_PER_REQUEST)
-
-    payload = req.model_dump()
-    body_hash = idem_hash(payload, user_id)
-    if idempotency_key:
-        cached = idem_get(db, user_id, idempotency_key, str(request.url.path), body_hash)
-        if cached:
-            return cached
 
     loc = req.location_override or fetch_user_location_and_country(user_id)
     if not loc.country or str(loc.country).strip().lower() not in NZ_NAMES:
@@ -935,18 +844,14 @@ def salons_search(
                 phone=item.get("phone") or item.get("phone_number"),
                 website=item.get("website") or item.get("link"),
                 rating=float(item.get("rating")) if item.get("rating") is not None else None,
-                reviews=int(item.get("reviews") or item.get("reviews_count")) if (item.get("reviews") or item.get("reviews_count")) is not None else None,
+                reviews=int(item.get("reviews") or item.get("reviews_count"))
+                if (item.get("reviews") or item.get("reviews_count")) is not None
+                else None,
             )
         )
 
     salons.sort(key=lambda s: (-(s.rating or 0.0), -(s.reviews or 0)))
-    resp = SalonSearchResponse(salons=salons[:limit], meta={"query_used": q, "request_id": rid}).model_dump()
-
-    if idempotency_key:
-        idem_put(db, user_id, idempotency_key, str(request.url.path), body_hash, resp)
-
-    return resp
-
+    return SalonSearchResponse(salons=salons[:limit], meta={"query_used": q, "request_id": rid})
 
 @app.post("/api/v1/booking/start-payment", response_model=StartBookingPaymentResponse)
 def start_booking_payment(req: StartBookingPaymentRequest, user_id: str = Depends(get_current_user_id)):
@@ -954,7 +859,6 @@ def start_booking_payment(req: StartBookingPaymentRequest, user_id: str = Depend
     if not session.url:
         raise HTTPException(status_code=500, detail="Stripe session URL is missing")
     return StartBookingPaymentResponse(checkout_url=session.url, stripe_session_id=session.id)
-
 
 @app.post("/api/v1/booking/reveal", response_model=RevealBookingResponse)
 def reveal_booking(
@@ -991,7 +895,6 @@ def reveal_booking(
         evidence=evidence,
         credits_left=get_user_credit(user_id),
     )
-
 
 @app.post("/api/v1/stripe/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
