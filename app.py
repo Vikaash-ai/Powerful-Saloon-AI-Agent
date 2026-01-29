@@ -457,9 +457,8 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
 
 
 def fetch_user_location_and_country(user_id: str) -> UserLocation:
-    row = postgrest_get_single(settings.SUPABASE_PROFILES_TABLE, "city,suburb,postcode,country", {PROFILE_KEY_COL: user_id})
+    row = postgrest_get_single(settings.SUPABASE_PROFILES_TABLE, "city,suburb,post_code,country", {PROFILE_KEY_COL: user_id})
     return UserLocation(city=row.get("city"), suburb=row.get("suburb"), postcode=row.get("postcode"), country=row.get("country"))
-
 
 # -----------------------------------------------------------------------------
 # Tool budget + helpers
