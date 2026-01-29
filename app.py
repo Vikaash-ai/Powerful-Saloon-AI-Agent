@@ -388,7 +388,10 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
             time.sleep(0.5 * attempt)
             continue
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"Supabase read failed: {e.response.status_code}") from e
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase read failed: {e.response.status_code} - {e.response.text}"
+            ) from e
         except Exception as e:
             last_err = e
             break
