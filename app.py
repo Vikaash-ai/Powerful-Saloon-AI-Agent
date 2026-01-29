@@ -921,6 +921,24 @@ def reveal_booking(
         credits_left=get_user_credit(user_id),
     )
 
+@app.get("/api/v1/debug/env")
+def debug_env():
+    return {
+        "allowed_origins": settings.allowed_origins_list(),
+        "supabase_url": settings.SUPABASE_URL.strip(),
+        "profiles_table": settings.SUPABASE_PROFILES_TABLE,
+        "serp_engine": settings.SERPAPI_ENGINE,
+    }
+
+@app.get("/api/v1/debug/supabase-profile")
+def debug_supabase_profile(user_id: str = Depends(get_current_user_id)):
+    row = postgrest_get_single(
+        table=settings.SUPABASE_PROFILES_TABLE,
+        select_cols="id,city,suburb,postcode,country,credit",
+        filters={"id": user_id},
+    )
+    return {"user_id": user_id, "row": row}
+
 @app.post("/api/v1/stripe/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.body()
