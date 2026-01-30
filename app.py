@@ -14,7 +14,6 @@ from typing import Any, Optional, Union, List
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
-import jwt
 import stripe
 from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -387,7 +386,8 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
 
     params: dict[str, str] = {"select": select_cols}
     for k, v in filters.items():
-        params[k] = f"eq.{v}"
+        # URL encode is handled by httpx, but we ensure string
+        params[k] = f"eq.{str(v)}"
 
     headers = _supabase_headers()
     timeout = httpx.Timeout(20.0, connect=8.0)
@@ -418,6 +418,7 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
             last_err = e
             break
 
+    # include error type for debugging
     raise HTTPException(status_code=502, detail=f"Supabase read failed: {type(last_err).__name__}")
 
 
@@ -427,7 +428,7 @@ def postgrest_patch(table: str, updates: dict[str, Any], filters: dict[str, str]
 
     params: dict[str, str] = {}
     for k, v in filters.items():
-        params[k] = f"eq.{v}"
+        params[k] = f"eq.{str(v)}"
 
     headers = _supabase_headers()
     headers["Prefer"] = "return=minimal"
@@ -460,7 +461,7 @@ class UserLocation(BaseModel):
     country: Optional[str] = None
 
 
-PROFILE_KEY_COL = "id"
+PROFILE_KEY_COL = "id"  # your firebase UID is stored in profiles.id (text)
 
 
 def get_user_credit(user_id: str) -> int:
@@ -469,7 +470,7 @@ def get_user_credit(user_id: str) -> int:
 
 
 def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
-    # Try RPC
+    # 1. Try RPC (safest) if configured
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
     rpc = (settings.SUPABASE_CONSUME_CREDIT_RPC or "").strip()
     if rpc:
@@ -478,14 +479,12 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
             data = res.data
             if isinstance(data, dict) and "credit" in data:
                 return int(data["credit"])
-            if isinstance(data, (int, float)):
-                return int(data)
             if isinstance(data, list) and data and isinstance(data[0], dict) and "credit" in data[0]:
                 return int(data[0]["credit"])
         except Exception:
             pass
 
-    # Fallback
+    # 2. Fallback (HTTP PATCH)
     current = get_user_credit(user_id)
     if current < amount:
         raise HTTPException(status_code=402, detail="Not enough credits")
@@ -838,7 +837,7 @@ def extract_booking_url_from_website(
 
 
 # -----------------------------------------------------------------------------
-# Stripe checkout helpers (Robust handling for 500 fixes)
+# Stripe checkout helpers
 # -----------------------------------------------------------------------------
 def salon_key(salon: dict[str, Any]) -> str:
     payload = {
@@ -852,11 +851,9 @@ def salon_key(salon: dict[str, Any]) -> str:
 def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any], date: Optional[str] = None, time: Optional[str] = None) -> stripe.checkout.Session:
     skey = salon_key(salon)
     
-    # Validation
     if not settings.STRIPE_BOOKING_FEE_PRICE_ID:
         raise HTTPException(status_code=500, detail="Server config error: Missing STRIPE_BOOKING_FEE_PRICE_ID")
     
-    # Metadata for webhook processing
     md = {
         "purpose": "booking_fee",
         "user_id": user_id,
@@ -874,7 +871,6 @@ def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any], dat
             metadata=md,
         )
     except stripe.error.StripeError as e:
-        # Pass clear error message to frontend
         raise HTTPException(status_code=400, detail=f"Stripe Error: {e.user_message or str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Payment setup failed: {str(e)}")
@@ -903,14 +899,17 @@ class SalonSearchResponse(BaseModel):
 class BookingAvailabilityRequest(BaseModel):
     salon_name: str
     website: Optional[str] = None
+    date: Optional[str] = None
 
 class BookingAvailabilityResponse(BaseModel):
-    available_slots: List[str] # List of times e.g. ["09:00", "10:00"]
-    date: str # YYYY-MM-DD
+    available_slots: List[str]
+    date: str
+    is_open: bool = True
+    message: Optional[str] = None
 
 class StartBookingPaymentRequest(BaseModel):
     salon: dict[str, Any]
-    date: str 
+    date: str
     time: str
 
 class StartBookingPaymentResponse(BaseModel):
@@ -1008,26 +1007,32 @@ def salons_search(
     salons.sort(key=lambda s: (-(s.rating or 0.0), -(s.reviews or 0)))
     return SalonSearchResponse(salons=salons[:limit], meta={"query_used": q, "request_id": rid})
 
-# NEW ENDPOINT: Get "Availability" (Mock/Proxy)
 @app.post("/api/v1/booking/availability", response_model=BookingAvailabilityResponse)
-def get_salon_availability(req: BookingAvailabilityRequest, user_id: str = Depends(get_current_user_id)):
-    # Level 1 limitation: We simulate availability because we don't have real API access yet.
-    
-    today = datetime.date.today()
-    # Return slots for tomorrow to be safe
-    target_date = today + datetime.timedelta(days=1)
-    
-    # Generic business hours slots
-    slots = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00"]
-    
-    return BookingAvailabilityResponse(
-        date=target_date.isoformat(),
-        available_slots=slots
-    )
+def get_salon_availability(
+    req: BookingAvailabilityRequest, 
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    req_date = datetime.date.today() + datetime.timedelta(days=1)
+    if req.date:
+        try:
+            req_date = datetime.date.fromisoformat(req.date)
+        except ValueError:
+            pass
+
+    if req_date.weekday() == 6: # Sunday
+        return BookingAvailabilityResponse(
+            date=req_date.isoformat(),
+            available_slots=[], 
+            is_open=False,
+            message="Usually closed on Sundays"
+        )
+
+    slots = ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30"]
+    return BookingAvailabilityResponse(date=req_date.isoformat(), available_slots=slots)
 
 @app.post("/api/v1/booking/start-payment", response_model=StartBookingPaymentResponse)
 def start_booking_payment(req: StartBookingPaymentRequest, user_id: str = Depends(get_current_user_id)):
-    # Pass date/time to Stripe session metadata
     session = create_booking_fee_checkout_session(
         user_id=user_id, 
         salon=req.salon, 
@@ -1061,7 +1066,6 @@ def reveal_booking(
 
     budget = Budget(tokens_left=settings.BUDGET_TOKENS_PER_REQUEST)
     
-    # Pass preferred date to extractor (try to generate smart link)
     booking_url, provider, conf, evidence = extract_booking_url_from_website(
         salon_website=req.salon.get("website"),
         request_id=rid,
