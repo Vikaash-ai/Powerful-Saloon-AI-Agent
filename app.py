@@ -31,7 +31,7 @@ from firebase_admin import credentials
 
 
 # -----------------------------------------------------------------------------
-# Settings
+# Settings (Secrets loaded from Render Environment Variables)
 # -----------------------------------------------------------------------------
 class Settings(BaseSettings):
     APP_NAME: str = "Saloon AI Agent"
@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_PROFILES_TABLE: str = "profiles"
+    SUPABASE_CONSUME_CREDIT_RPC: str = "consume_credit"
 
     # Firebase Admin credentials
     FIREBASE_PROJECT_ID: str
@@ -115,7 +116,7 @@ class Settings(BaseSettings):
     def allowed_ports(self) -> set[int]:
         return {int(p.strip()) for p in self.SAFE_FETCH_ALLOWED_PORTS.split(",") if p.strip()}
 
-    def deny_domains(self) -> set[int] | set[str]:
+    def deny_domains(self) -> set[str]:
         return {d.strip().lower() for d in self.DOMAIN_DENYLIST.split(",") if d.strip()}
 
     def provider_domains(self) -> set[str]:
@@ -127,6 +128,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("backend")
 
@@ -135,8 +137,10 @@ def jlog(event: str, **fields: Any) -> str:
     return json.dumps({"event": event, **fields}, ensure_ascii=False, separators=(",", ":"))
 
 
+# Stripe init
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
+# Firebase Admin init
 if not firebase_admin._apps:
     private_key = settings.FIREBASE_PRIVATE_KEY.replace("\\n", "\n")
     cred = credentials.Certificate(
@@ -288,6 +292,19 @@ class BanAndRateLimitMiddleware(BaseHTTPMiddleware):
                 security_event(db, f"ip:{ip}", "ratelimit")
             return JSONResponse(status_code=429, content={"detail": "Rate limit (IP)"})
 
+        authz = request.headers.get("authorization", "")
+        if authz.startswith("Bearer "):
+            token = authz.split(" ", 1)[1].strip()
+            try:
+                decoded = fb_auth.verify_id_token(token, check_revoked=False)
+                uid = decoded.get("uid") or decoded.get("sub") or "unknown"
+                if not _take_token(_RL_USER, uid, settings.RL_USER_RPS, settings.RL_BURST):
+                    with SessionLocal() as db:
+                        security_event(db, f"user:{uid}", "ratelimit")
+                    return JSONResponse(status_code=429, content={"detail": "Rate limit (user)"})
+            except Exception:
+                pass
+
         return await call_next(request)
 
 
@@ -334,13 +351,12 @@ def get_current_user_id(authorization: str = Header(default="")) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Supabase via PostgREST HTTP (strip() FIX)
+# Supabase via PostgREST HTTP
 # -----------------------------------------------------------------------------
 def _postgrest_base() -> str:
     return settings.SUPABASE_URL.strip().rstrip("/") + "/rest/v1"
 
 def _sanitize_header_value(v: str) -> str:
-    # Remove surrounding whitespace and any control characters (including newlines)
     v = (v or "").strip()
     v = "".join(ch for ch in v if 32 <= ord(ch) <= 126)
     return v
@@ -396,7 +412,6 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
             last_err = e
             break
 
-    # include error type for debugging
     raise HTTPException(status_code=502, detail=f"Supabase read failed: {type(last_err).__name__}")
 
 
@@ -424,7 +439,7 @@ def postgrest_patch(table: str, updates: dict[str, Any], filters: dict[str, str]
             time.sleep(0.5 * attempt)
             continue
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"Supabase update failed: {e.response.status_code}") from e
+            raise HTTPException(status_code=502, detail=f"Supabase update failed: {e.response.status_code} - {e.response.text}") from e
         except Exception as e:
             last_err = e
             break
@@ -439,7 +454,8 @@ class UserLocation(BaseModel):
     country: Optional[str] = None
 
 
-PROFILE_KEY_COL = "id"  # change to "user_id" if needed
+# We filter by 'id' because your Firebase UID matches 'id' in Supabase
+PROFILE_KEY_COL = "id"
 
 
 def get_user_credit(user_id: str) -> int:
@@ -448,6 +464,21 @@ def get_user_credit(user_id: str) -> int:
 
 
 def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
+    # 1. Try RPC (safest) if configured
+    sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    rpc = (settings.SUPABASE_CONSUME_CREDIT_RPC or "").strip()
+    if rpc:
+        try:
+            res = sb.rpc(rpc, {"p_user_id": user_id, "p_amount": amount}).execute()
+            data = res.data
+            if isinstance(data, dict) and "credit" in data:
+                return int(data["credit"])
+            if isinstance(data, list) and data and isinstance(data[0], dict) and "credit" in data[0]:
+                return int(data[0]["credit"])
+        except Exception:
+            pass
+
+    # 2. Fallback (HTTP PATCH)
     current = get_user_credit(user_id)
     if current < amount:
         raise HTTPException(status_code=402, detail="Not enough credits")
@@ -457,6 +488,7 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
 
 
 def fetch_user_location_and_country(user_id: str) -> UserLocation:
+    # Use post_code as per your table schema
     row = postgrest_get_single(
         table=settings.SUPABASE_PROFILES_TABLE,
         select_cols="city,suburb,post_code,country",
@@ -714,11 +746,7 @@ def extract_booking_url_from_website(
         soup = BeautifulSoup(html, "lxml")
         anchors = soup.find_all("a", limit=settings.BOOKING_SCAN_MAX_ANCHORS)
 
-        best_url = None
-        best_score = 0
-        evidence: dict[str, Any] = {}
-        seen: set[str] = set()
-
+        candidates: list[tuple[str, str]] = []
         for a in anchors:
             href = a.get("href")
             if not href:
@@ -728,9 +756,16 @@ def extract_booking_url_from_website(
                 continue
             full = urljoin(website, href)
             text = (a.get_text(" ", strip=True) or "")[:120]
+            candidates.append((full, text))
 
+        best_url = None
+        best_score = 0
+        evidence: dict[str, Any] = {}
+        seen: set[str] = set()
+
+        for url, text in candidates[: settings.BOOKING_SCAN_MAX_LINKS]:
             try:
-                u = normalize_and_validate_url(full)
+                u = normalize_and_validate_url(url)
                 u = strip_tracking_params(u)
             except Exception:
                 continue
@@ -753,7 +788,7 @@ def extract_booking_url_from_website(
 
 
 # -----------------------------------------------------------------------------
-# Stripe checkout helpers
+# Stripe checkout helpers (Robust handling for 500 fixes)
 # -----------------------------------------------------------------------------
 def salon_key(salon: dict[str, Any]) -> str:
     payload = {
@@ -766,13 +801,24 @@ def salon_key(salon: dict[str, Any]) -> str:
 
 def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any]) -> stripe.checkout.Session:
     skey = salon_key(salon)
-    return stripe.checkout.Session.create(
-        mode="payment",
-        success_url=settings.STRIPE_SUCCESS_URL,
-        cancel_url=settings.STRIPE_CANCEL_URL,
-        line_items=[{"price": settings.STRIPE_BOOKING_FEE_PRICE_ID, "quantity": 1}],
-        metadata={"purpose": "booking_fee", "user_id": user_id, "salon_key": skey},
-    )
+    
+    # Validation
+    if not settings.STRIPE_BOOKING_FEE_PRICE_ID:
+        raise HTTPException(status_code=500, detail="Server config error: Missing STRIPE_BOOKING_FEE_PRICE_ID")
+        
+    try:
+        return stripe.checkout.Session.create(
+            mode="payment",
+            success_url=settings.STRIPE_SUCCESS_URL,
+            cancel_url=settings.STRIPE_CANCEL_URL,
+            line_items=[{"price": settings.STRIPE_BOOKING_FEE_PRICE_ID, "quantity": 1}],
+            metadata={"purpose": "booking_fee", "user_id": user_id, "salon_key": skey},
+        )
+    except stripe.error.StripeError as e:
+        # Pass clear error message to frontend
+        raise HTTPException(status_code=400, detail=f"Stripe Error: {e.user_message or str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Payment setup failed: {str(e)}")
 
 
 # -----------------------------------------------------------------------------
@@ -830,6 +876,11 @@ app.add_middleware(RequestIdMiddleware)
 app.add_middleware(BanAndRateLimitMiddleware)
 app.add_middleware(ErrorHandlerMiddleware)
 
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    log.exception("UNHANDLED: %s", str(exc))
+    return JSONResponse(status_code=500, content={"detail": "Internal server error", "error": str(exc)})
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -843,11 +894,6 @@ def root():
         "allowed_origins": settings.allowed_origins_list(),
         "hint": "Try /docs, /api/v1/health",
     }
-
-@app.get("/api/v1/debug/serp-key")
-def debug_serp_key():
-    k = (settings.SERPAPI_API_KEY or "").strip()
-    return {"starts_with": k[:4], "length": len(k)}
 
 @app.get("/api/v1/health")
 def health():
@@ -933,24 +979,6 @@ def reveal_booking(
         evidence=evidence,
         credits_left=get_user_credit(user_id),
     )
-
-@app.get("/api/v1/debug/env")
-def debug_env():
-    return {
-        "allowed_origins": settings.allowed_origins_list(),
-        "supabase_url": settings.SUPABASE_URL.strip(),
-        "profiles_table": settings.SUPABASE_PROFILES_TABLE,
-        "serp_engine": settings.SERPAPI_ENGINE,
-    }
-
-@app.get("/api/v1/debug/supabase-profile")
-def debug_supabase_profile(user_id: str = Depends(get_current_user_id)):
-    row = postgrest_get_single(
-        table=settings.SUPABASE_PROFILES_TABLE,
-        select_cols="id,city,suburb,postcode,country,credit",
-        filters={"id": user_id},
-    )
-    return {"user_id": user_id, "row": row}
 
 @app.post("/api/v1/stripe/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
