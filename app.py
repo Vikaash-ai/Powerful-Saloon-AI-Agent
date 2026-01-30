@@ -14,6 +14,7 @@ from typing import Any, Optional, Union, List
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
+import jwt
 import stripe
 from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -29,6 +30,9 @@ from starlette.responses import JSONResponse, Response
 import firebase_admin
 from firebase_admin import auth as fb_auth
 from firebase_admin import credentials
+
+# Supabase via REST
+from supabase import create_client
 
 
 # -----------------------------------------------------------------------------
@@ -200,7 +204,7 @@ class BookingPayment(Base):
     stripe_session_id: Mapped[str] = mapped_column(String(128), index=True, unique=True)
     paid: Mapped[int] = mapped_column(Integer, default=1)
     
-    # Store appointment preference if selected
+    # Store user preference
     selected_date: Mapped[str] = mapped_column(String(20), nullable=True) # YYYY-MM-DD
     selected_time: Mapped[str] = mapped_column(String(10), nullable=True) # HH:MM
     
@@ -383,7 +387,7 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
 
     params: dict[str, str] = {"select": select_cols}
     for k, v in filters.items():
-        params[k] = f"eq.{str(v)}"
+        params[k] = f"eq.{v}"
 
     headers = _supabase_headers()
     timeout = httpx.Timeout(20.0, connect=8.0)
@@ -423,7 +427,7 @@ def postgrest_patch(table: str, updates: dict[str, Any], filters: dict[str, str]
 
     params: dict[str, str] = {}
     for k, v in filters.items():
-        params[k] = f"eq.{str(v)}"
+        params[k] = f"eq.{v}"
 
     headers = _supabase_headers()
     headers["Prefer"] = "return=minimal"
@@ -491,7 +495,7 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
 
 
 def fetch_user_location_and_country(user_id: str) -> UserLocation:
-    # Use post_code as determined earlier
+    # Use post_code as per your table schema
     row = postgrest_get_single(
         table=settings.SUPABASE_PROFILES_TABLE,
         select_cols="city,suburb,post_code,country",
@@ -741,13 +745,7 @@ def extract_booking_url_from_website(
     prov = detect_provider(website)
     # If website itself is provider, we just use it.
     if prov != "other":
-        url_to_use = website
-        # Attempt to pre-fill date if possible (Level 1 "Smart Link")
-        if preferred_date:
-            # Example logic for common providers (naive)
-            # Square: square.site/book/... usually handles flow step by step
-            pass 
-        return url_to_use, prov, booking_confidence(website), {"source": "website_is_provider"}
+        return website, prov, booking_confidence(website), {"source": "website_is_provider"}
 
     if not budget.can_fetch():
         return None, "none", 0, {"source": "budget_no_fetch"}
@@ -840,7 +838,7 @@ def extract_booking_url_from_website(
 
 
 # -----------------------------------------------------------------------------
-# Stripe checkout helpers
+# Stripe checkout helpers (Robust handling for 500 fixes)
 # -----------------------------------------------------------------------------
 def salon_key(salon: dict[str, Any]) -> str:
     payload = {
@@ -854,10 +852,11 @@ def salon_key(salon: dict[str, Any]) -> str:
 def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any], date: Optional[str] = None, time: Optional[str] = None) -> stripe.checkout.Session:
     skey = salon_key(salon)
     
+    # Validation
     if not settings.STRIPE_BOOKING_FEE_PRICE_ID:
         raise HTTPException(status_code=500, detail="Server config error: Missing STRIPE_BOOKING_FEE_PRICE_ID")
     
-    # Store selected date/time in metadata
+    # Metadata for webhook processing
     md = {
         "purpose": "booking_fee",
         "user_id": user_id,
@@ -875,6 +874,7 @@ def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any], dat
             metadata=md,
         )
     except stripe.error.StripeError as e:
+        # Pass clear error message to frontend
         raise HTTPException(status_code=400, detail=f"Stripe Error: {e.user_message or str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Payment setup failed: {str(e)}")
@@ -910,8 +910,8 @@ class BookingAvailabilityResponse(BaseModel):
 
 class StartBookingPaymentRequest(BaseModel):
     salon: dict[str, Any]
-    date: str # YYYY-MM-DD
-    time: str # HH:MM
+    date: str 
+    time: str
 
 class StartBookingPaymentResponse(BaseModel):
     checkout_url: str
@@ -1012,7 +1012,6 @@ def salons_search(
 @app.post("/api/v1/booking/availability", response_model=BookingAvailabilityResponse)
 def get_salon_availability(req: BookingAvailabilityRequest, user_id: str = Depends(get_current_user_id)):
     # Level 1 limitation: We simulate availability because we don't have real API access yet.
-    # Future Level 2: Integrate Square/Timely APIs here.
     
     today = datetime.date.today()
     # Return slots for tomorrow to be safe
