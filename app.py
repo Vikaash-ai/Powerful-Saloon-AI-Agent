@@ -8,8 +8,9 @@ import re
 import socket
 import time
 import uuid
+import datetime
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, List
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
@@ -31,7 +32,7 @@ from firebase_admin import credentials
 
 
 # -----------------------------------------------------------------------------
-# Settings (Secrets loaded from Render Environment Variables)
+# Settings (NO hardcoded secrets here)
 # -----------------------------------------------------------------------------
 class Settings(BaseSettings):
     APP_NAME: str = "Saloon AI Agent"
@@ -49,7 +50,7 @@ class Settings(BaseSettings):
     # Firebase Admin credentials
     FIREBASE_PROJECT_ID: str
     FIREBASE_CLIENT_EMAIL: str
-    FIREBASE_PRIVATE_KEY: str  # store with \n in env; we convert.
+    FIREBASE_PRIVATE_KEY: str
 
     # SerpApi
     SERPAPI_API_KEY: str
@@ -66,7 +67,7 @@ class Settings(BaseSettings):
     STRIPE_BOOKING_FEE_PRICE_ID: str
 
     # Safe fetch (SSRF)
-    SAFE_FETCH_USER_AGENT: str = "SalonAgentBot/4.0"
+    SAFE_FETCH_USER_AGENT: str = "SalonAgentBot/5.0"
     SAFE_FETCH_TIMEOUT_S: float = 8.0
     SAFE_FETCH_MAX_BYTES: int = 900_000
     SAFE_FETCH_ALLOW_PRIVATE_IPS: bool = False
@@ -128,7 +129,6 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("backend")
 
@@ -137,10 +137,8 @@ def jlog(event: str, **fields: Any) -> str:
     return json.dumps({"event": event, **fields}, ensure_ascii=False, separators=(",", ":"))
 
 
-# Stripe init
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-# Firebase Admin init
 if not firebase_admin._apps:
     private_key = settings.FIREBASE_PRIVATE_KEY.replace("\\n", "\n")
     cred = credentials.Certificate(
@@ -201,6 +199,11 @@ class BookingPayment(Base):
     salon_key: Mapped[str] = mapped_column(String(64), index=True)
     stripe_session_id: Mapped[str] = mapped_column(String(128), index=True, unique=True)
     paid: Mapped[int] = mapped_column(Integer, default=1)
+    
+    # Store appointment preference if selected
+    selected_date: Mapped[str] = mapped_column(String(20), nullable=True) # YYYY-MM-DD
+    selected_time: Mapped[str] = mapped_column(String(10), nullable=True) # HH:MM
+    
     created_at: Mapped[int] = mapped_column(Integer, default=lambda: int(time.time()), index=True)
 
 
@@ -221,7 +224,7 @@ def get_db():
 
 
 # -----------------------------------------------------------------------------
-# Middleware (rate limit/bans)
+# Middleware
 # -----------------------------------------------------------------------------
 @dataclass
 class Bucket:
@@ -365,7 +368,6 @@ def _sanitize_header_value(v: str) -> str:
 def _supabase_headers() -> dict[str, str]:
     key = _sanitize_header_value(settings.SUPABASE_SERVICE_ROLE_KEY)
     if not key.startswith("eyJ"):
-        # helps you catch wrong key instantly
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY is invalid/malformed")
     return {
         "apikey": key,
@@ -381,7 +383,7 @@ def postgrest_get_single(table: str, select_cols: str, filters: dict[str, str]) 
 
     params: dict[str, str] = {"select": select_cols}
     for k, v in filters.items():
-        params[k] = f"eq.{v}"
+        params[k] = f"eq.{str(v)}"
 
     headers = _supabase_headers()
     timeout = httpx.Timeout(20.0, connect=8.0)
@@ -421,7 +423,7 @@ def postgrest_patch(table: str, updates: dict[str, Any], filters: dict[str, str]
 
     params: dict[str, str] = {}
     for k, v in filters.items():
-        params[k] = f"eq.{v}"
+        params[k] = f"eq.{str(v)}"
 
     headers = _supabase_headers()
     headers["Prefer"] = "return=minimal"
@@ -454,7 +456,6 @@ class UserLocation(BaseModel):
     country: Optional[str] = None
 
 
-# We filter by 'id' because your Firebase UID matches 'id' in Supabase
 PROFILE_KEY_COL = "id"
 
 
@@ -464,7 +465,7 @@ def get_user_credit(user_id: str) -> int:
 
 
 def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
-    # 1. Try RPC (safest) if configured
+    # Try RPC
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
     rpc = (settings.SUPABASE_CONSUME_CREDIT_RPC or "").strip()
     if rpc:
@@ -473,12 +474,14 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
             data = res.data
             if isinstance(data, dict) and "credit" in data:
                 return int(data["credit"])
+            if isinstance(data, (int, float)):
+                return int(data)
             if isinstance(data, list) and data and isinstance(data[0], dict) and "credit" in data[0]:
                 return int(data[0]["credit"])
         except Exception:
             pass
 
-    # 2. Fallback (HTTP PATCH)
+    # Fallback
     current = get_user_credit(user_id)
     if current < amount:
         raise HTTPException(status_code=402, detail="Not enough credits")
@@ -488,7 +491,7 @@ def consume_credit_atomic(user_id: str, amount: int = 1) -> int:
 
 
 def fetch_user_location_and_country(user_id: str) -> UserLocation:
-    # Use post_code as per your table schema
+    # Use post_code as determined earlier
     row = postgrest_get_single(
         table=settings.SUPABASE_PROFILES_TABLE,
         select_cols="city,suburb,post_code,country",
@@ -725,6 +728,7 @@ def extract_booking_url_from_website(
     salon_website: Optional[str],
     request_id: str,
     budget: Budget,
+    preferred_date: Optional[str] = None
 ) -> tuple[Optional[str], str, int, dict[str, Any]]:
     if not salon_website:
         return None, "none", 0, {}
@@ -735,8 +739,15 @@ def extract_booking_url_from_website(
         return None, "none", 0, {}
 
     prov = detect_provider(website)
+    # If website itself is provider, we just use it.
     if prov != "other":
-        return website, prov, booking_confidence(website), {"source": "website_is_provider"}
+        url_to_use = website
+        # Attempt to pre-fill date if possible (Level 1 "Smart Link")
+        if preferred_date:
+            # Example logic for common providers (naive)
+            # Square: square.site/book/... usually handles flow step by step
+            pass 
+        return url_to_use, prov, booking_confidence(website), {"source": "website_is_provider"}
 
     if not budget.can_fetch():
         return None, "none", 0, {"source": "budget_no_fetch"}
@@ -782,13 +793,54 @@ def extract_booking_url_from_website(
         if best_url:
             return best_url, detect_provider(best_url), best_score, evidence
 
+        # one-hop well-known paths
+        if settings.BOOKING_ONE_HOP_INTERNAL_CRAWL and budget.can_fetch():
+            parsed = urlparse(website)
+            base = urlunparse((parsed.scheme, parsed.netloc, "/", "", "", ""))
+            for p in settings.booking_paths():
+                if not budget.can_fetch():
+                    break
+                guess = urljoin(base, p.lstrip("/"))
+                budget.spend(settings.COST_WEB_FETCH_ONE_HOP)
+                budget.website_fetches += 1
+                try:
+                    html2 = safe_fetch_html(guess, request_id, budget)
+                except Exception:
+                    continue
+                soup2 = BeautifulSoup(html2, "lxml")
+                anchors2 = soup2.find_all("a", limit=settings.BOOKING_SCAN_MAX_ANCHORS)
+                candidates2: list[tuple[str, str]] = []
+                for a in anchors2:
+                    href = a.get("href")
+                    if not href:
+                        continue
+                    full = urljoin(guess, href.strip())
+                    text = (a.get_text(" ", strip=True) or "")[:120]
+                    candidates2.append((full, text))
+
+                for url, text in candidates2[: settings.BOOKING_SCAN_MAX_LINKS]:
+                    try:
+                        u = normalize_and_validate_url(url)
+                        u = strip_tracking_params(u)
+                    except Exception:
+                        continue
+                    sc = booking_confidence(u, anchor_text=text)
+                    if sc > best_score and booking_link_allowed(website, u):
+                        best_url = u
+                        best_score = sc
+                        evidence = {"anchor_text": text, "source": "well_known_path", "page": guess}
+                        break
+
+                if best_url:
+                    return best_url, detect_provider(best_url), best_score, evidence
+
         return None, "none", 0, {"source": "no_booking_found"}
     except Exception:
         return None, "none", 0, {"source": "fetch_failed"}
 
 
 # -----------------------------------------------------------------------------
-# Stripe checkout helpers (Robust handling for 500 fixes)
+# Stripe checkout helpers
 # -----------------------------------------------------------------------------
 def salon_key(salon: dict[str, Any]) -> str:
     payload = {
@@ -799,23 +851,30 @@ def salon_key(salon: dict[str, Any]) -> str:
     }
     return sha256(json.dumps(payload, sort_keys=True))
 
-def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any]) -> stripe.checkout.Session:
+def create_booking_fee_checkout_session(user_id: str, salon: dict[str, Any], date: Optional[str] = None, time: Optional[str] = None) -> stripe.checkout.Session:
     skey = salon_key(salon)
     
-    # Validation
     if not settings.STRIPE_BOOKING_FEE_PRICE_ID:
         raise HTTPException(status_code=500, detail="Server config error: Missing STRIPE_BOOKING_FEE_PRICE_ID")
-        
+    
+    # Store selected date/time in metadata
+    md = {
+        "purpose": "booking_fee",
+        "user_id": user_id,
+        "salon_key": skey,
+        "selected_date": date or "",
+        "selected_time": time or ""
+    }
+
     try:
         return stripe.checkout.Session.create(
             mode="payment",
             success_url=settings.STRIPE_SUCCESS_URL,
             cancel_url=settings.STRIPE_CANCEL_URL,
             line_items=[{"price": settings.STRIPE_BOOKING_FEE_PRICE_ID, "quantity": 1}],
-            metadata={"purpose": "booking_fee", "user_id": user_id, "salon_key": skey},
+            metadata=md,
         )
     except stripe.error.StripeError as e:
-        # Pass clear error message to frontend
         raise HTTPException(status_code=400, detail=f"Stripe Error: {e.user_message or str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Payment setup failed: {str(e)}")
@@ -841,8 +900,18 @@ class SalonSearchResponse(BaseModel):
     salons: list[SalonResult]
     meta: dict[str, Any] = {}
 
+class BookingAvailabilityRequest(BaseModel):
+    salon_name: str
+    website: Optional[str] = None
+
+class BookingAvailabilityResponse(BaseModel):
+    available_slots: List[str] # List of times e.g. ["09:00", "10:00"]
+    date: str # YYYY-MM-DD
+
 class StartBookingPaymentRequest(BaseModel):
     salon: dict[str, Any]
+    date: str # YYYY-MM-DD
+    time: str # HH:MM
 
 class StartBookingPaymentResponse(BaseModel):
     checkout_url: str
@@ -858,6 +927,8 @@ class RevealBookingResponse(BaseModel):
     booking_confidence: int = 0
     evidence: dict[str, Any] = {}
     credits_left: Optional[int] = None
+    selected_date: Optional[str] = None
+    selected_time: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -937,9 +1008,33 @@ def salons_search(
     salons.sort(key=lambda s: (-(s.rating or 0.0), -(s.reviews or 0)))
     return SalonSearchResponse(salons=salons[:limit], meta={"query_used": q, "request_id": rid})
 
+# NEW ENDPOINT: Get "Availability" (Mock/Proxy)
+@app.post("/api/v1/booking/availability", response_model=BookingAvailabilityResponse)
+def get_salon_availability(req: BookingAvailabilityRequest, user_id: str = Depends(get_current_user_id)):
+    # Level 1 limitation: We simulate availability because we don't have real API access yet.
+    # Future Level 2: Integrate Square/Timely APIs here.
+    
+    today = datetime.date.today()
+    # Return slots for tomorrow to be safe
+    target_date = today + datetime.timedelta(days=1)
+    
+    # Generic business hours slots
+    slots = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00"]
+    
+    return BookingAvailabilityResponse(
+        date=target_date.isoformat(),
+        available_slots=slots
+    )
+
 @app.post("/api/v1/booking/start-payment", response_model=StartBookingPaymentResponse)
 def start_booking_payment(req: StartBookingPaymentRequest, user_id: str = Depends(get_current_user_id)):
-    session = create_booking_fee_checkout_session(user_id=user_id, salon=req.salon)
+    # Pass date/time to Stripe session metadata
+    session = create_booking_fee_checkout_session(
+        user_id=user_id, 
+        salon=req.salon, 
+        date=req.date, 
+        time=req.time
+    )
     if not session.url:
         raise HTTPException(status_code=500, detail="Stripe session URL is missing")
     return StartBookingPaymentResponse(checkout_url=session.url, stripe_session_id=session.id)
@@ -966,10 +1061,13 @@ def reveal_booking(
         raise HTTPException(status_code=403, detail="Payment not verified yet")
 
     budget = Budget(tokens_left=settings.BUDGET_TOKENS_PER_REQUEST)
+    
+    # Pass preferred date to extractor (try to generate smart link)
     booking_url, provider, conf, evidence = extract_booking_url_from_website(
         salon_website=req.salon.get("website"),
         request_id=rid,
         budget=budget,
+        preferred_date=row.selected_date 
     )
 
     return RevealBookingResponse(
@@ -978,6 +1076,8 @@ def reveal_booking(
         booking_confidence=conf,
         evidence=evidence,
         credits_left=get_user_credit(user_id),
+        selected_date=row.selected_date,
+        selected_time=row.selected_time
     )
 
 @app.post("/api/v1/stripe/webhook")
@@ -1002,6 +1102,8 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     user_id = metadata.get("user_id")
     skey = metadata.get("salon_key")
     session_id = session.get("id")
+    sel_date = metadata.get("selected_date")
+    sel_time = metadata.get("selected_time")
 
     if not user_id or not skey or not session_id:
         return JSONResponse(status_code=400, content={"detail": "Missing metadata"})
@@ -1015,7 +1117,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     except HTTPException:
         return JSONResponse(status_code=409, content={"detail": "Paid but no credits available"})
 
-    db.add(BookingPayment(user_id=user_id, salon_key=skey, stripe_session_id=session_id, paid=1))
+    db.add(BookingPayment(
+        user_id=user_id, 
+        salon_key=skey, 
+        stripe_session_id=session_id, 
+        paid=1,
+        selected_date=sel_date,
+        selected_time=sel_time
+    ))
     db.commit()
 
     log.info(jlog("stripe_booking_fee_paid", user_id=user_id, salon_key=skey, session_id=session_id, credits_left=remaining))
